@@ -1,12 +1,19 @@
 package discord
 
 import (
+	"github.com/automuteus/galactus/broker"
+	"github.com/automuteus/galactus/discord"
 	"github.com/bwmarrin/discordgo"
 	"github.com/denverquane/amongusdiscord/game"
+	"github.com/denverquane/amongusdiscord/metrics"
+	rediscommon "github.com/denverquane/amongusdiscord/redis-common"
 	"github.com/denverquane/amongusdiscord/storage"
 	"log"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Bot struct {
@@ -21,11 +28,17 @@ type Bot struct {
 
 	ChannelsMapLock sync.RWMutex
 
-	SessionManager *SessionManager
+	PrimarySession *discordgo.Session
+
+	GalactusClient *GalactusClient
 
 	RedisInterface *RedisInterface
 
 	StorageInterface *storage.StorageInterface
+
+	PostgresInterface *storage.PsqlInterface
+
+	MetricsCollector *metrics.MetricsCollector
 
 	logPath string
 
@@ -37,22 +50,20 @@ var Commit string
 
 // MakeAndStartBot does what it sounds like
 //TODO collapse these fields into proper structs?
-func MakeAndStartBot(version, commit, token, token2, url, emojiGuildID string, numShards, shardID int, redisInterface *RedisInterface, storageInterface *storage.StorageInterface, logPath string, timeoutSecs int) *Bot {
+func MakeAndStartBot(version, commit, token, url, emojiGuildID string, extraTokens []string, numShards, shardID int, redisInterface *RedisInterface, storageInterface *storage.StorageInterface, psql *storage.PsqlInterface, gc *GalactusClient, logPath string) *Bot {
 	Version = version
 	Commit = commit
-
-	var altDiscordSession *discordgo.Session = nil
 
 	dg, err := discordgo.New("Bot " + token)
 	if err != nil {
 		log.Println("error creating Discord session,", err)
 		return nil
 	}
-	if token2 != "" {
-		altDiscordSession, err = discordgo.New("Bot " + token2)
+
+	for _, v := range extraTokens {
+		err := gc.AddToken(v)
 		if err != nil {
-			log.Println("error creating 2nd Discord session,", err)
-			return nil
+			log.Println("error adding extra bot token to galactus:", err)
 		}
 	}
 
@@ -60,11 +71,6 @@ func MakeAndStartBot(version, commit, token, token2, url, emojiGuildID string, n
 		log.Printf("Identifying to the Discord API with %d total shards, and shard ID=%d\n", numShards, shardID)
 		dg.ShardCount = numShards
 		dg.ShardID = shardID
-		if altDiscordSession != nil {
-			log.Printf("Identifying to the Discord API for the 2nd Bot with %d total shards, and shard ID=%d\n", numShards, shardID)
-			altDiscordSession.ShardCount = numShards
-			altDiscordSession.ShardID = shardID
-		}
 	}
 
 	bot := Bot{
@@ -72,14 +78,18 @@ func MakeAndStartBot(version, commit, token, token2, url, emojiGuildID string, n
 		ConnsToGames: make(map[string]string),
 		StatusEmojis: emptyStatusEmojis(),
 
-		EndGameChannels:  make(map[string]chan EndGameMessage),
-		ChannelsMapLock:  sync.RWMutex{},
-		SessionManager:   NewSessionManager(dg, altDiscordSession),
-		RedisInterface:   redisInterface,
-		StorageInterface: storageInterface,
-		logPath:          logPath,
-		captureTimeout:   timeoutSecs,
+		EndGameChannels:   make(map[string]chan EndGameMessage),
+		ChannelsMapLock:   sync.RWMutex{},
+		PrimarySession:    dg,
+		GalactusClient:    gc,
+		RedisInterface:    redisInterface,
+		StorageInterface:  storageInterface,
+		PostgresInterface: psql,
+		logPath:           logPath,
+		captureTimeout:    GameTimeoutSeconds,
+		MetricsCollector:  metrics.NewMetricsCollector(),
 	}
+	dg.LogLevel = discordgo.LogInformational
 
 	dg.AddHandler(bot.handleVoiceStateChange)
 	// Register the messageCreate func as a callback for MessageCreate events.
@@ -90,6 +100,8 @@ func MakeAndStartBot(version, commit, token, token2, url, emojiGuildID string, n
 
 	dg.Identify.Intents = discordgo.MakeIntent(discordgo.IntentsGuildVoiceStates | discordgo.IntentsGuildMessages | discordgo.IntentsGuilds | discordgo.IntentsGuildMessageReactions)
 
+	discord.WaitForToken(bot.RedisInterface.client, token)
+	discord.MarkIdentifyAndLockForToken(bot.RedisInterface.client, token)
 	//Open a websocket connection to Discord and begin listening.
 	err = dg.Open()
 	if err != nil {
@@ -97,33 +109,33 @@ func MakeAndStartBot(version, commit, token, token2, url, emojiGuildID string, n
 		return nil
 	}
 
-	if altDiscordSession != nil {
-		altDiscordSession.AddHandler(bot.newAltGuild)
-		altDiscordSession.Identify.Intents = discordgo.MakeIntent(discordgo.IntentsGuilds)
-		err = altDiscordSession.Open()
-		if err != nil {
-			log.Println("Could not connect 2nd Bot to the Discord Servers with error:", err)
-			return nil
-		}
-	}
+	rediscommon.SetVersionAndCommit(bot.RedisInterface.client, Version, Commit)
 
-	status := &discordgo.UpdateStatusData{
-		IdleSince: nil,
-		Game: &discordgo.Game{
-			Name: "Tomsi ist sus!",
-			Type: discordgo.GameTypeListening,
-		},
-		AFK:    false,
-		Status: "",
-	}
-
-	dg.UpdateStatusComplex(*status)
-
-	bot.RedisInterface.SetVersionAndCommit(Version, Commit)
+	go metrics.PrometheusMetricsServer(os.Getenv("SCW_NODE_ID"), "2112", bot.MetricsCollector)
 
 	go StartHealthCheckServer("8080")
 
 	log.Println("Finished identifying to the Discord API. Now ready for incoming events")
+
+	listeningTo := os.Getenv("AUTOMUTEUS_LISTENING")
+	if listeningTo == "" {
+		listeningTo = ".au help"
+	}
+
+	status := &discordgo.UpdateStatusData{
+		IdleSince: nil,
+		Activities: &[]discordgo.Game{
+			{
+				Name: listeningTo,
+				Type: discordgo.GameTypeListening,
+			}},
+		AFK:    false,
+		Status: "",
+	}
+	err = dg.UpdateStatusComplex(*status)
+	if err != nil {
+		log.Println(err)
+	}
 
 	return &bot
 }
@@ -137,8 +149,9 @@ func (bot *Bot) GracefulClose() {
 	bot.ChannelsMapLock.RUnlock()
 }
 func (bot *Bot) Close() {
-	bot.SessionManager.Close()
+	bot.PrimarySession.Close()
 	bot.RedisInterface.Close()
+	bot.StorageInterface.Close()
 }
 
 func (bot *Bot) PurgeConnection(socketID string) {
@@ -168,34 +181,47 @@ func (bot *Bot) gracefulShutdownWorker(guildID, connCode string) {
 	log.Println("Finished gracefully shutting down")
 }
 
+var EmojiLock = sync.Mutex{}
+var AllEmojisStartup []*discordgo.Emoji = nil
+
 func (bot *Bot) newGuild(emojiGuildID string) func(s *discordgo.Session, m *discordgo.GuildCreate) {
 	return func(s *discordgo.Session, m *discordgo.GuildCreate) {
+		gid, err := strconv.ParseUint(m.Guild.ID, 10, 64)
+		if err != nil {
+			log.Println(err)
+		}
+		go bot.PostgresInterface.EnsureGuildExists(gid, m.Guild.Name)
 
 		log.Printf("Added to new Guild, id %s, name %s", m.Guild.ID, m.Guild.Name)
 		bot.RedisInterface.AddUniqueGuildCounter(m.Guild.ID, Version)
-
-		//f, err := os.Create(path.Join(bot.logPath, m.Guild.ID+"_log.txt"))
-		//w := io.MultiWriter(os.Stdout)
-		//if err != nil {
-		//	log.Println("Couldn't create logger for " + m.Guild.ID + "; only using stdout for logging")
-		//} else {
-		//	w = io.MultiWriter(f, os.Stdout)
-		//}
 
 		if emojiGuildID == "" {
 			log.Println("[This is not an error] No explicit guildID provided for emojis; using the current guild default")
 			emojiGuildID = m.Guild.ID
 		}
-		allEmojis, err := s.GuildEmojis(emojiGuildID)
-		if err != nil {
-			log.Println(err)
+
+		EmojiLock.Lock()
+		if AllEmojisStartup == nil {
+			allEmojis, err := s.GuildEmojis(emojiGuildID)
+			if err != nil {
+				log.Println(err)
+			} else {
+				bot.addAllMissingEmojis(s, m.Guild.ID, true, allEmojis)
+				bot.addAllMissingEmojis(s, m.Guild.ID, false, allEmojis)
+
+				if os.Getenv("AUTOMUTEUS_OFFICIAL") != "" {
+					AllEmojisStartup = allEmojis
+					log.Println("Skipping subsequent guilds; emojis added successfully")
+				}
+			}
 		} else {
-			bot.addAllMissingEmojis(s, m.Guild.ID, true, allEmojis)
+			bot.addAllMissingEmojis(s, m.Guild.ID, true, AllEmojisStartup)
 
-			bot.addAllMissingEmojis(s, m.Guild.ID, false, allEmojis)
+			bot.addAllMissingEmojis(s, m.Guild.ID, false, AllEmojisStartup)
 		}
+		EmojiLock.Unlock()
 
-		games := bot.RedisInterface.LoadAllActiveGamesAndDelete(m.Guild.ID)
+		games := bot.RedisInterface.LoadAllActiveGames(m.Guild.ID)
 
 		for _, connCode := range games {
 			gsr := GameStateRequest{
@@ -203,7 +229,10 @@ func (bot *Bot) newGuild(emojiGuildID string) func(s *discordgo.Session, m *disc
 				ConnectCode: connCode,
 			}
 			lock, dgs := bot.RedisInterface.GetDiscordGameStateAndLock(gsr)
-			if lock != nil && dgs != nil && !dgs.Subscribed && dgs.ConnectCode != "" {
+			for lock == nil {
+				lock, dgs = bot.RedisInterface.GetDiscordGameStateAndLock(gsr)
+			}
+			if dgs != nil && dgs.ConnectCode != "" {
 				log.Println("Resubscribing to Redis events for an old game: " + connCode)
 				killChan := make(chan EndGameMessage)
 				go bot.SubscribeToGameByConnectCode(gsr.GuildID, dgs.ConnectCode, killChan)
@@ -214,19 +243,9 @@ func (bot *Bot) newGuild(emojiGuildID string) func(s *discordgo.Session, m *disc
 				bot.ChannelsMapLock.Lock()
 				bot.EndGameChannels[dgs.ConnectCode] = killChan
 				bot.ChannelsMapLock.Unlock()
-			} else if lock != nil {
-				//log.Println("UNLOCKING")
-				lock.Release(ctx)
 			}
+			lock.Release(ctx)
 		}
-
-		//if len(games) == 0 {
-		//	dsg := NewDiscordGameState(m.Guild.ID)
-		//
-		//	//put an empty entry in Redis
-		//	bot.RedisInterface.SetDiscordGameState(dsg, nil)
-		//}
-
 	}
 }
 
@@ -238,10 +257,6 @@ func (bot *Bot) leaveGuild(s *discordgo.Session, m *discordgo.GuildDelete) {
 	if err != nil {
 		log.Println(err)
 	}
-}
-
-func (bot *Bot) newAltGuild(s *discordgo.Session, m *discordgo.GuildCreate) {
-	bot.SessionManager.RegisterGuildSecondSession(m.Guild.ID)
 }
 
 func (bot *Bot) linkPlayer(s *discordgo.Session, dgs *DiscordGameState, args []string) {
@@ -296,8 +311,7 @@ func (bot *Bot) gracefulEndGame(gsr GameStateRequest) {
 	//log.Println("lock obtained for game end")
 
 	if dgs.Linked && dgs.GameStateMsg.MessageID != "" && dgs.GameStateMsg.MessageChannelID != "" {
-		sess := bot.SessionManager.GetPrimarySession()
-		sess.ChannelMessageSend(dgs.GameStateMsg.MessageChannelID, "Your game might be momentarily disrupted while I upgrade...")
+		bot.PrimarySession.ChannelMessageSend(dgs.GameStateMsg.MessageChannelID, "Your game might be momentarily disrupted while I upgrade...")
 	}
 
 	dgs.Subscribed = false
@@ -310,25 +324,72 @@ func (bot *Bot) gracefulEndGame(gsr GameStateRequest) {
 
 	bot.RedisInterface.SetDiscordGameState(dgs, lock)
 	sett := bot.StorageInterface.GetGuildSettings(gsr.GuildID)
-	dgs.Edit(bot.SessionManager.GetPrimarySession(), bot.gameStateResponse(dgs, sett))
+	edited := dgs.Edit(bot.PrimarySession, bot.gameStateResponse(dgs, sett))
+	if edited {
+		bot.MetricsCollector.RecordDiscordRequests(bot.RedisInterface.client, metrics.MessageEdit, 1)
+	}
 
 	log.Println("Done saving guild data")
 }
 
 func (bot *Bot) forceEndGame(gsr GameStateRequest) {
-	lock, dgs := bot.RedisInterface.GetDiscordGameStateAndLock(gsr)
-	if lock == nil {
-		return
+	dgs := bot.RedisInterface.GetReadOnlyDiscordGameState(gsr)
+
+	broker.RemoveActiveGame(bot.RedisInterface.client, dgs.ConnectCode)
+
+	sett := bot.StorageInterface.GetGuildSettings(dgs.GuildID)
+	oldPhase := dgs.AmongUsData.GetPhase()
+	deleteTime := sett.GetDeleteGameSummaryMinutes()
+	//only print a fancy formatted message if the game actually got to the lobby or another phase. Otherwise, delete
+	if oldPhase != game.MENU && deleteTime != 0 {
+		dgs.AmongUsData.UpdatePhase(game.GAMEOVER)
+		edited := dgs.Edit(bot.PrimarySession, bot.gameStateResponse(dgs, sett))
+		if edited {
+			bot.MetricsCollector.RecordDiscordRequests(bot.RedisInterface.client, metrics.MessageEdit, 1)
+		}
+		dgs.RemoveAllReactions(bot.PrimarySession)
+		if deleteTime != -1 {
+			go MessageDeleteWorker(bot.PrimarySession, dgs.GameStateMsg.MessageChannelID, dgs.GameStateMsg.MessageID, time.Minute*time.Duration(deleteTime))
+		}
+	} else {
+		deleteMessage(bot.PrimarySession, dgs.GameStateMsg.MessageChannelID, dgs.GameStateMsg.MessageID)
+		bot.MetricsCollector.RecordDiscordRequests(bot.RedisInterface.client, metrics.MessageCreateDelete, 1)
 	}
-
-	dgs.AmongUsData.SetAllAlive()
-	dgs.AmongUsData.UpdatePhase(game.LOBBY)
-	dgs.AmongUsData.SetRoomRegion("", "")
-
-	lock.Release(ctx)
 
 	bot.RedisInterface.RemoveOldGame(dgs.GuildID, dgs.ConnectCode)
 
 	//TODO this shouldn't be necessary with the TTL of the keys, but it can't hurt to clean up...
 	bot.RedisInterface.DeleteDiscordGameState(dgs)
+}
+
+func MessageDeleteWorker(s *discordgo.Session, msgChannelID, msgID string, waitDur time.Duration) {
+	log.Printf("Message worker is sleeping for %s before deleting message", waitDur.String())
+	time.Sleep(waitDur)
+	deleteMessage(s, msgChannelID, msgID)
+}
+
+func (bot *Bot) RefreshGameStateMessage(gsr GameStateRequest, sett *storage.GuildSettings) {
+	lock, dgs := bot.RedisInterface.GetDiscordGameStateAndLock(gsr)
+	if lock == nil {
+		return
+	}
+
+	del := dgs.DeleteGameStateMsg(bot.PrimarySession) //delete the old message
+	if del {
+		bot.MetricsCollector.RecordDiscordRequests(bot.RedisInterface.client, metrics.MessageCreateDelete, 1)
+	}
+
+	if dgs.GameStateMsg.MessageChannelID != "" && del {
+		dgs.CreateMessage(bot.PrimarySession, bot.gameStateResponse(dgs, sett), dgs.GameStateMsg.MessageChannelID, dgs.GameStateMsg.LeaderID)
+		bot.MetricsCollector.RecordDiscordRequests(bot.RedisInterface.client, metrics.MessageCreateDelete, 1)
+	}
+
+	bot.RedisInterface.SetDiscordGameState(dgs, lock)
+	//add the emojis to the refreshed message
+
+	if dgs.GameStateMsg.MessageChannelID != "" && dgs.GameStateMsg.MessageID != "" {
+		bot.MetricsCollector.RecordDiscordRequests(bot.RedisInterface.client, metrics.ReactionAdd, 1)
+		dgs.AddReaction(bot.PrimarySession, "▶️")
+		//go dgs.AddAllReactions(bot.PrimarySession, bot.StatusEmojis[true])
+	}
 }
