@@ -110,7 +110,7 @@ func MakeAndStartBot(version, commit, token, token2, url, emojiGuildID string, n
 	status := &discordgo.UpdateStatusData{
 		IdleSince: nil,
 		Game: &discordgo.Game{
-			Name: ".au help",
+			Name: "Tomsi ist sus!",
 			Type: discordgo.GameTypeListening,
 		},
 		AFK:    false,
